@@ -1,0 +1,52 @@
+# =============================================================================
+# security.yml —— CodeQL 静态扫描（对应 Security Guide 一章 Use-CodeQL-as-a-step-in-a-workflow）
+#
+#   跟 ci-cd.yml 分开成独立 workflow：安全扫描不该卡在部署门禁里阻塞发布节奏，
+#   PR/push/每周定时都跑，发现的问题走 Security 标签页单独跟进。
+#   脚本注入攻防（Risk-of-Script-Injection-Attack / Mitigating-Script-Injection-Attack）
+#   是文字层面的坑，不是"跑起来"的东西，讲解 + before/after 示例放在 lab-ops.md 里，
+#   不在这个仓库放一个真的有漏洞的 workflow 文件。
+# =============================================================================
+name: 'CodeQL'
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+    branches: ['main']
+  schedule:
+    - cron: '30 13 * * 4'   # 每周四跑一次兜底扫描，即使没有新 push/PR
+  workflow_dispatch: {}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      security-events: write   # 上传扫描结果到 Security 标签页需要
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none   # dasher-svc 是纯 JS，不需要编译，CodeQL 直接静态分析源码
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # queries: security-extended, security-and-quality   # 想要更严格规则集时打开
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:${{ matrix.language }}'

@@ -1,0 +1,261 @@
+# =============================================================================
+# ci-cd.yml —— dasher-svc 的生产味 CI/CD 一条龙
+#
+#   test(矩阵 node18/20) → build-push(GHCR) → bump-gitops-dev(改 GitOps 仓库)
+#     → verify-dev(自建 runner，只读冒烟) → promote-prod(人工审批门)
+#     → verify-prod(自建 runner，只读冒烟) → report(可复用 workflow，always())
+#
+# ⚠️ 这门课的 CD 职责边界（重要，反复强调因为很容易被误解）：
+#   本流水线只负责把新镜像 tag "写进"一个独立的 GitOps 配置仓库（改 Git、commit、push），
+#   全程不出现任何 `kubectl apply` / `kubectl set image`。真正把新版本同步到集群，
+#   是另一条腿——ArgoCD 持续监听 GitOps 仓库、自动 sync 到 dasher-dev / dasher-prod
+#   两个 namespace（那是 labs/argocd/ 大实验的地盘）。
+#   verify-dev / verify-prod 两个 job 用自建 runner 只做"部署后冒烟校验"（curl 断言
+#   线上版本号），不是用自建 runner 去做部署——CI 不该有 kubectl 权限，GitOps 仓库才是
+#   唯一的部署入口，这个区分本身就是很好的面试点。
+#
+# GitHub-hosted runner 够用于 test/build/推镜像/改 GitOps 仓库；但 verify 阶段要连到
+# 主人本机 WSL2 里的 k3d 集群（GitHub 云端服务器连不到内网），所以这两步必须落在自建
+# runner 上——这正是 Self-Hosted Runner 这一章的真实用武之地。
+#
+# 覆盖的核心概念（括号里标了对应哪一课，方便对照 lab-ops.md）：
+#   matrix / concurrency / timeout / job outputs / if-expression / artifacts /
+#   environments(dev 自动、prod 需人工审批) / composite action / reusable workflow
+# =============================================================================
+name: dasher-svc CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_prod:
+        description: 'true = 只走到 dev 冒烟为止，不推进 prod（还没在仓库 Settings 配 prod 审批人时用这个自测）'
+        required: false
+        default: 'false'
+        type: string
+
+# 同一个 ref 的新 push 会取消掉还在跑的旧 run，省 CI 资源
+# （生产里如果流水线已经推进到 prod 审批阶段，直接取消可能留下"半吊子"状态——
+#  这里为了 lab 简单直接 cancel-in-progress: true，真实项目建议只在 dev 之前的 job 这样做）。
+concurrency:
+  group: dasher-svc-cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+# 默认最小权限（对应 Security Guide「Least Privilege」），需要更高权限的 job 自己声明。
+permissions:
+  contents: read
+
+env:
+  APP_DIR: app
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dasher-svc
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 测试：matrix node 18/20（Using-a-matrix-for-your-jobs / Additional-Matrix-Configuration）
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit Test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10          # Timeout-for-Jobs-and-Steps 一课
+    strategy:
+      fail-fast: false           # 一条腿挂了另一条腿继续跑完，两个 node 版本的结果都要看到
+      matrix:
+        node: [18, 20]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}（带 npm 缓存，Cache-Node-Dependencies 一课）
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/package.json
+
+      - name: npm install
+        working-directory: ${{ env.APP_DIR }}
+        run: npm install
+
+      - name: npm test（node --test，测试挂 = 流水线红 = 不部署，这是 CI 门禁）
+        working-directory: ${{ env.APP_DIR }}
+        run: npm test | tee test-output.log
+
+      # 只在 node20 这条腿上传，避免同名 artifact 在 actions/upload-artifact@v4 下
+      # 多个矩阵腿并发上传冲突（v4 起同名 artifact 不再像 v3 那样自动合并）——
+      # 这个坑本身就是面试可以聊的点。对应 Storing-workflow-data-as-artifacts 一课。
+      - name: 上传测试日志 artifact
+        if: matrix.node == 20
+        uses: actions/upload-artifact@v4
+        with:
+          name: dasher-svc-test-log
+          path: ${{ env.APP_DIR }}/test-output.log
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2) 构建 + 推镜像到 GHCR（Workflow-Docker-Login / Build-and-Test / Push / GitHub-Packages）
+  # ---------------------------------------------------------------------------
+  build-push:
+    name: Build & Push Image (GHCR)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write            # 推 GHCR 需要的最小权限
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 算本次制品 tag（对应 Jenkins 大实验同款套路：run_number + git 短7位sha，可追溯）
+        id: meta
+        run: |
+          short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          echo "tag=${{ github.run_number }}-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: 登录 GHCR（内置 GITHUB_TOKEN 就够，不需要额外 PAT）
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: docker build + push（tag = <run_number>-<git短sha>）
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.APP_DIR }}
+          push: true
+          build-args: |
+            BUILD_TAG=${{ steps.meta.outputs.tag }}
+            GIT_SHA=${{ steps.meta.outputs.short_sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+
+  # ---------------------------------------------------------------------------
+  # 3) 把新 tag 写进 GitOps 仓库的 dev overlay（Custom-Actions：composite action）
+  #    environment: dev 且不配保护规则 = 直通，不用人工审批（对应 Continuous
+  #    Deployment 章节 Create-Dev-Environment-Secrets-Environment-Rules）
+  # ---------------------------------------------------------------------------
+  bump-gitops-dev:
+    name: Bump GitOps Tag (dev)
+    needs: build-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dev
+    steps:
+      - name: Checkout（拿到本仓库里的 composite action 定义）
+        uses: actions/checkout@v4
+
+      - name: 调用自定义 composite action，只改 GitOps 仓库不碰集群
+        uses: ./.github/actions/bump-gitops-tag
+        with:
+          overlay: dev
+          # 必须跟 gitops-repo overlays/*/kustomization.yaml 里 images[].name 写的完整镜像名
+          # 逐字一致（那边写的是 ghcr.io/OWNER/dasher-svc 而不是短名 dasher-svc），
+          # 否则下面 action 里的 yq select 匹配不到，tag 会静默不更新（Codex 审阅抓到的真 bug）。
+          image-name: ${{ env.IMAGE }}
+          image: ${{ env.IMAGE }}
+          tag: ${{ needs.build-push.outputs.tag }}
+          gitops-repo: ${{ secrets.GITOPS_REPO }}
+          gitops-pat: ${{ secrets.GITOPS_PAT }}
+
+  # ---------------------------------------------------------------------------
+  # 4) dev 冒烟验证：自建 runner，只读！（Self-Hosted-Runner 全章）
+  # ---------------------------------------------------------------------------
+  verify-dev:
+    name: Verify Dev (Self-Hosted Runner, 只读)
+    needs: [bump-gitops-dev, build-push]
+    runs-on: [self-hosted, wsl2-k3d]
+    timeout-minutes: 5
+    steps:
+      - name: 给 ArgoCD 一点时间把新 tag 同步进 dasher-dev
+        # 简化处理：真实场景应该轮询 ArgoCD Application 的 sync/health 状态而不是死等，
+        # 但那是 ArgoCD 大实验的地盘，这里只做最小闭环演示。
+        run: sleep 15
+
+      - name: curl dasher-dev（NodePort 30081），断言线上 tag == 本次构建 tag
+        env:
+          EXPECT_TAG: ${{ needs.build-push.outputs.tag }}
+        run: |
+          set -euo pipefail
+          actual=$(curl -fsS http://localhost:30081/api/version | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+          echo "dasher-dev 线上版本 = ${actual} ；期望 = ${EXPECT_TAG}"
+          if [ "$actual" != "$EXPECT_TAG" ]; then
+            echo "❌ dev 环境版本不符（可能 ArgoCD 还没同步完，或部署有问题）"
+            exit 1
+          fi
+          echo "✅ dev 环境已是本次构建版本"
+          # 注意：这一步全程只有 curl，没有 kubectl apply / kubectl set image 之类的写操作。
+          # 自建 runner 只做验证，部署入口只有 GitOps 仓库——CI 不该有 kubectl 权限。
+
+  # ---------------------------------------------------------------------------
+  # 5) 推进 prod：environment: prod，人工审批门
+  #    ⚠️ required reviewer 需要主人手动去仓库 Settings → Environments → prod
+  #       勾 "Required reviewers"，脚本做不到，这里只能声明 environment 名字。
+  #    （Using-if-expression-in-Jobs + workflow-dispatch-Input-Options 两课）
+  # ---------------------------------------------------------------------------
+  promote-prod:
+    name: Bump GitOps Tag (prod, 需人工审批)
+    needs: [verify-dev, build-push]
+    if: ${{ github.event.inputs.skip_prod != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 调用同一个 composite action，这次改 prod overlay
+        uses: ./.github/actions/bump-gitops-tag
+        with:
+          overlay: prod
+          image-name: ${{ env.IMAGE }}   # 同上，要跟 overlay 里 images[].name 的完整镜像名一致
+          image: ${{ env.IMAGE }}
+          tag: ${{ needs.build-push.outputs.tag }}
+          gitops-repo: ${{ secrets.GITOPS_REPO }}
+          gitops-pat: ${{ secrets.GITOPS_PAT }}
+
+  # ---------------------------------------------------------------------------
+  # 6) prod 冒烟验证：还是自建 runner，还是只读
+  # ---------------------------------------------------------------------------
+  verify-prod:
+    name: Verify Prod (Self-Hosted Runner, 只读)
+    needs: [promote-prod, build-push]
+    if: ${{ needs.promote-prod.result == 'success' }}
+    runs-on: [self-hosted, wsl2-k3d]
+    timeout-minutes: 5
+    steps:
+      - name: 给 ArgoCD 一点时间把新 tag 同步进 dasher-prod
+        run: sleep 15
+
+      - name: curl dasher-prod（NodePort 30082），断言线上 tag == 本次构建 tag
+        env:
+          EXPECT_TAG: ${{ needs.build-push.outputs.tag }}
+        run: |
+          set -euo pipefail
+          actual=$(curl -fsS http://localhost:30082/api/version | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+          echo "dasher-prod 线上版本 = ${actual} ；期望 = ${EXPECT_TAG}"
+          if [ "$actual" != "$EXPECT_TAG" ]; then
+            echo "❌ prod 环境版本不符"
+            exit 1
+          fi
+          echo "✅ prod 环境已是本次构建版本"
+
+  # ---------------------------------------------------------------------------
+  # 7) 用可复用 workflow 报告结果，if: always() 保证不管前面成败都跑
+  #    （Reusable-Workflows-and-Reporting 全章）
+  # ---------------------------------------------------------------------------
+  report:
+    name: Report Result (Reusable Workflow)
+    needs: [test, build-push, bump-gitops-dev, verify-dev, promote-prod, verify-prod]
+    if: always()
+    uses: ./.github/workflows/notify-slack.yml
+    with:
+      # needs.*.result 是 GitHub Actions 的对象过滤(object filter)语法：
+      # 把 needs 这个 map 里每个 job 的 .result 取出来拼成数组，再用 contains() 判断有没有失败。
+      status: ${{ contains(needs.*.result, 'failure') && 'failure' || (contains(needs.*.result, 'cancelled') && 'cancelled' || 'success') }}
+      tag: ${{ needs.build-push.outputs.tag || 'unknown' }}
+    secrets: inherit

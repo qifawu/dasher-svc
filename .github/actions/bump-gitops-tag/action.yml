@@ -1,0 +1,107 @@
+# =============================================================================
+# bump-gitops-tag/action.yml —— composite action（对应 Custom Actions 一章）
+#
+#   职责很单一也很明确：把 dasher-svc 新镜像的 tag 写进【独立的 GitOps 配置仓库】
+#   某个 overlay 的 kustomization.yaml，commit + push。仅此而已——不装 kubectl，
+#   不碰任何集群。这是本流水线里唯一"改状态"的地方，其余步骤全是只读验证。
+#
+#   GitOps 仓库结构（由 ArgoCD 大实验 labs/argocd/gitops-repo/ 持有模板）：
+#     overlays/<dev|prod>/kustomization.yaml
+#       images:
+#         - name: ghcr.io/<owner>/dasher-svc   # 完整镜像地址，要跟下面 image-name 输入逐字一致
+#           newTag: <old-tag>
+#   ⚠️ 模板里的 <owner> 默认是字面量占位符 OWNER，用之前必须手动换成真实 GitHub 用户名/组织名
+#   （否则下面 select(.name == ...) 匹配不到，tag 静默不更新且不报错，见 lab-ops.md 第 6 步）。
+#
+#   为什么composite而不是 docker/javascript action：这里全是 shell 命令 + 调用
+#   官方 checkout action，composite 最省事，不用额外的 Dockerfile/Node 运行时
+#   （对应 Metadata-syntax-for-GitHub-Actions 里三种 runs.using 的取舍）。
+# =============================================================================
+name: 'Bump GitOps Image Tag'
+description: '把 dasher-svc 新镜像 tag 写进 GitOps 配置仓库对应 overlay 的 kustomization.yaml 并 commit+push'
+branding:
+  icon: 'git-pull-request'
+  color: 'blue'
+
+inputs:
+  overlay:
+    description: 'GitOps 仓库里的 overlay 目录名（overlays/<overlay>），如 dev 或 prod'
+    required: true
+  image-name:
+    description: 'kustomization.yaml 里 images[].name 要匹配的短名'
+    required: true
+    default: 'dasher-svc'
+  image:
+    description: '镜像仓库地址（不含 tag），如 ghcr.io/OWNER/dasher-svc，写进 images[].newName'
+    required: true
+  tag:
+    description: '本次构建的镜像 tag，写进 images[].newTag'
+    required: true
+  gitops-repo:
+    description: 'GitOps 配置仓库，owner/repo 格式（来自仓库级 secret GITOPS_REPO）'
+    required: true
+  gitops-pat:
+    description: '有 push 权限的 PAT（来自仓库级 secret GITOPS_PAT；跨仓库 GITHUB_TOKEN 权限不够）'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: checkout GitOps 配置仓库
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.gitops-repo }}
+        token: ${{ inputs.gitops-pat }}
+        path: gitops-repo
+
+    - name: 装 yq（官方 release 二进制，K8s 生态主流工具，跟 setup.sh 里装 k3d/kubectl 同一来源风格）
+      shell: bash
+      run: |
+        if ! command -v yq >/dev/null 2>&1; then
+          sudo curl -fsSL -o /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+        fi
+        yq --version
+
+    - name: 改 overlays/${{ inputs.overlay }}/kustomization.yaml 的镜像 name+tag
+      shell: bash
+      env:
+        FILE: gitops-repo/overlays/${{ inputs.overlay }}/kustomization.yaml
+        IMAGE_NAME: ${{ inputs.image-name }}
+        IMAGE_REF: ${{ inputs.image }}
+        IMAGE_TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$FILE" ]; then
+          echo "❌ 没找到 $FILE —— 检查 GitOps 仓库结构 / overlay 名字是否配对"
+          exit 1
+        fi
+        # 用 strenv() 把 shell 环境变量喂给 yq 表达式，而不是把 ${{ inputs.tag }}
+        # 直接拼进表达式字符串——这跟 Security Guide「Mitigating Script Injection」
+        # 一课的思路是同一件事：把不可信/外部输入放进 env，别让它直接进可执行的表达式/命令行。
+        yq -i '
+          (.images[] | select(.name == strenv(IMAGE_NAME))).newName = strenv(IMAGE_REF) |
+          (.images[] | select(.name == strenv(IMAGE_NAME))).newTag = strenv(IMAGE_TAG)
+        ' "$FILE"
+        echo "改后内容："
+        cat "$FILE"
+
+    - name: commit + push（本流水线唯一允许"改状态"的一步——只改 Git，不碰集群）
+      shell: bash
+      working-directory: gitops-repo
+      env:
+        OVERLAY: ${{ inputs.overlay }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        IMAGE_TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add "overlays/${OVERLAY}/kustomization.yaml"
+        if git diff --cached --quiet; then
+          echo "tag 没变化，跳过 commit（幂等，避免空 commit 噪音）"
+        else
+          git commit -m "chore(${OVERLAY}): bump ${IMAGE_NAME} image tag to ${IMAGE_TAG}"
+          git push
+        fi

@@ -1,0 +1,17 @@
+{
+  "name": "dasher-svc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub Actions CI/CD 大实验用的 Dasher 外卖订单服务（呼应课程 Meeting with Dasher Team 场景）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

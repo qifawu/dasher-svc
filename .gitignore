@@ -1,0 +1,3 @@
+node_modules/
+runner/wsl2-k3d/actions-runner/
+*.log

@@ -1,0 +1,58 @@
+# =============================================================================
+# notify-slack.yml —— 可复用 workflow（对应 Reusable Workflows and Reporting 一章）
+#
+#   用 `on: workflow_call` 而不是 `on: workflow_dispatch`，被 ci-cd.yml 用
+#   `uses: ./.github/workflows/notify-slack.yml` + `with:` 调用，避免把上报逻辑
+#   重复写在多个 job 里（Understanding-Reusable-Workflows / Step-1~4 系列课）。
+#
+#   没配 SLACK_WEBHOOK_URL secret 也不能让整条流水线跑不通——这是"lab 能不能
+#   一次跑通"的关键：optional secret + if 判断，没配就退化成打日志。
+# =============================================================================
+name: Notify Result (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        description: '整条流水线的最终结果：success / failure / cancelled'
+        required: true
+        type: string
+      tag:
+        description: '本次构建/部署的镜像 tag'
+        required: true
+        type: string
+    secrets:
+      SLACK_WEBHOOK_URL:
+        description: 'Slack Incoming Webhook URL（可选；不配就只打日志，不报错）'
+        required: false
+
+jobs:
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检查有没有配 Slack Webhook
+        id: check
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "has_webhook=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_webhook=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 对应 Slack-Notify-GitHub-Action 一课：rtCamp/action-slack-notify@v2
+      - name: 发 Slack 通知
+        if: steps.check.outputs.has_webhook == 'true'
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_TITLE: 'dasher-svc CI/CD'
+          SLACK_MESSAGE: "status=${{ inputs.status }} tag=${{ inputs.tag }} run=${{ github.run_id }}"
+          SLACK_COLOR: ${{ inputs.status == 'success' && 'good' || 'danger' }}
+
+      - name: 没配 Slack，退化为打印到日志（不让 lab 因为没配 Slack 就跑不通）
+        if: steps.check.outputs.has_webhook != 'true'
+        run: |
+          echo "ℹ️ 未配置 SLACK_WEBHOOK_URL secret，跳过真实通知，只打日志："
+          echo "   status=${{ inputs.status }}  tag=${{ inputs.tag }}  run=${{ github.run_id }}"

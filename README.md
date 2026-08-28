@@ -4,6 +4,12 @@
 "Meeting with Dasher Team" 的项目背景）从 push 代码到 GHCR 镜像、到 GitOps 配置仓库改 tag、
 到自建 runner 冒烟验证、到 prod 人工审批——一条龙走完 GitHub Actions 这门课几乎所有核心章节。
 
+**两份文档分工**：
+- **`HANDS-ON.md`** —— 从零**手写**这条流水线的完整教程（面试导向）：逐 key 讲 YAML、
+  怎么找对 action、自建 runner 专章、安全加固、**七个真实踩坑实录**、面试问答 15 题 + 验收清单。
+  想把这个项目讲进面试，看这份。
+- **`lab-ops.md`** —— 按课程章节顺序的**操作合集**（也是推进 Notion 的那份）。
+
 详细操作步骤看 **`lab-ops.md`**（按课程章节编号，跟 `labs/jenkins/lab-ops.md` 同一种写法）。
 本页只讲结构和"为什么这么设计"。
 
@@ -50,6 +56,7 @@ labs/github-actions/
 ├── faults/                       # 【原 CKA 大实验并入】部署故障注入排障（第 14 节）
 │   ├── README.md / inject.sh / solutions.md
 │   └── fixtures/                 #   PVC Pending / Pod Pending / broken-kubeconfig 三个故障夹具
+├── HANDS-ON.md                   # 从零手写流水线的完整教程（面试导向）
 ├── lab-ops.md                    # 操作合集（照课程章节顺序编号）
 └── README.md                     # 本文件
 ```

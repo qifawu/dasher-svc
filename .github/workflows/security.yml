@@ -15,12 +15,19 @@ on:
   pull_request:
     branches: ['main']
   schedule:
-    - cron: '30 13 * * 4'   # 每周四跑一次兜底扫描，即使没有新 push/PR
+    - cron: '30 13 * * 4'   # 每周四跑一次兜底扫描（cron 是 UTC，不是本地时区）
   workflow_dispatch: {}
 
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
+    # ⚠️ GitHub Free 下 code scanning 只对 public 仓库免费，private 仓库要买
+    #    GitHub Advanced Security。仓库是 private 时，CodeQL 扫描本身能跑完，
+    #    但最后 upload-sarif 会失败：
+    #      "Code scanning is not enabled for this repository"
+    #    结果是每次 push + 每周定时都发一封失败邮件，纯噪音。
+    #    所以这里按仓库可见性自动跳过——转回 public 就自动恢复，不用改文件。
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

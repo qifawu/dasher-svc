@@ -182,27 +182,37 @@ jobs:
     name: Verify Dev (Self-Hosted Runner, 只读)
     needs: [bump-gitops-dev, build-push]
     runs-on: [self-hosted, wsl2-k3d]
-    timeout-minutes: 5
+    timeout-minutes: 8            # 必须 > 下面的 TIMEOUT_SEC，否则轮询没跑完 job 先被杀
     steps:
-      - name: 给 ArgoCD 一点时间把新 tag 同步进 dasher-dev
-        # 简化处理：真实场景应该轮询 ArgoCD Application 的 sync/health 状态而不是死等，
-        # 但那是 ArgoCD 大实验的地盘，这里只做最小闭环演示。
-        run: sleep 15
-
-      - name: curl dasher-dev（NodePort 30081），断言线上 tag == 本次构建 tag
+      - name: 轮询等 ArgoCD 把新 tag 同步进 dasher-dev，并断言线上 tag == 本次构建 tag
         env:
           EXPECT_TAG: ${{ needs.build-push.outputs.tag }}
+          URL: http://localhost:30081/api/version
+          # ArgoCD 默认每 3 分钟才轮询一次 Git，所以这里的超时必须 > 180s。
+          # 死等一个固定 sleep 是错的：短了必然假失败，长了每次都白等满。
+          TIMEOUT_SEC: '300'
+          INTERVAL_SEC: '10'
         run: |
           set -euo pipefail
-          actual=$(curl -fsS http://localhost:30081/api/version | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
-          echo "dasher-dev 线上版本 = ${actual} ；期望 = ${EXPECT_TAG}"
-          if [ "$actual" != "$EXPECT_TAG" ]; then
-            echo "❌ dev 环境版本不符（可能 ArgoCD 还没同步完，或部署有问题）"
-            exit 1
-          fi
-          echo "✅ dev 环境已是本次构建版本"
-          # 注意：这一步全程只有 curl，没有 kubectl apply / kubectl set image 之类的写操作。
-          # 自建 runner 只做验证，部署入口只有 GitOps 仓库——CI 不该有 kubectl 权限。
+          deadline=$(( $(date +%s) + TIMEOUT_SEC ))
+          actual=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            # -f 让 4xx/5xx 变非 0 退出码；|| true 是因为滚动更新期间连不上是正常的，要继续等
+            body=$(curl -fsS --max-time 5 "$URL" 2>/dev/null || true)
+            actual=$(printf '%s' "$body" | grep -o '"version":"[^"]*"' | cut -d'"' -f4 || true)
+            if [ "$actual" = "$EXPECT_TAG" ]; then
+              echo "✅ dasher-dev 已是本次构建版本：$actual"
+              exit 0
+            fi
+            echo "  等 ArgoCD 同步中… 线上=${actual:-<连不上>} 期望=$EXPECT_TAG"
+            sleep "$INTERVAL_SEC"
+          done
+          echo "❌ 超时 ${TIMEOUT_SEC}s：dasher-dev 线上版本=${actual:-<连不上>}，期望=$EXPECT_TAG"
+          echo "   排查顺序：① ArgoCD Application 是不是 Synced/Healthy"
+          echo "            ② GitOps 仓库的 overlays/dev/kustomization.yaml newTag 对不对"
+          echo "            ③ Pod 是不是 CrashLoopBackOff（多架构镜像没出 arm64？）"
+          exit 1
+          # 全程只有 curl，没有 kubectl —— 自建 runner 只做验证，不做部署。
 
   # ---------------------------------------------------------------------------
   # 5) 推进 prod：environment: prod，人工审批门
@@ -239,23 +249,42 @@ jobs:
     needs: [promote-prod, build-push]
     if: ${{ needs.promote-prod.result == 'success' }}
     runs-on: [self-hosted, wsl2-k3d]
-    timeout-minutes: 5
+    timeout-minutes: 12           # 必须 > 下面的 TIMEOUT_SEC
     steps:
-      - name: 给 ArgoCD 一点时间把新 tag 同步进 dasher-prod
-        run: sleep 15
-
-      - name: curl dasher-prod（NodePort 30082），断言线上 tag == 本次构建 tag
+      - name: 轮询等 ArgoCD 把新 tag 同步进 dasher-prod，并断言线上 tag == 本次构建 tag
         env:
           EXPECT_TAG: ${{ needs.build-push.outputs.tag }}
+          URL: http://localhost:30082/api/version
+          # ⚠️ prod 的 ArgoCD Application 是【手动 sync】（syncPolicy 没配 automated），
+          # 这是刻意设计：GitHub 这边过了审批门只代表"批准发布这个版本"，
+          # 真正推到生产还要运维在 ArgoCD 里再点一次 Sync —— 两道闸门分属两个系统。
+          # 所以这个窗口是留给人操作的，比 dev 长。要放行就跑：
+          #   multipass exec gitops-labs -- argocd app sync dasher-prod
+          #   （或 kubectl -n argocd patch app dasher-prod --type merge \
+          #      -p '{"operation":{"sync":{"revision":"HEAD"}}}'）
+          TIMEOUT_SEC: '420'
+          INTERVAL_SEC: '10'
         run: |
           set -euo pipefail
-          actual=$(curl -fsS http://localhost:30082/api/version | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
-          echo "dasher-prod 线上版本 = ${actual} ；期望 = ${EXPECT_TAG}"
-          if [ "$actual" != "$EXPECT_TAG" ]; then
-            echo "❌ prod 环境版本不符"
-            exit 1
-          fi
-          echo "✅ prod 环境已是本次构建版本"
+          deadline=$(( $(date +%s) + TIMEOUT_SEC ))
+          actual=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            # -f 让 4xx/5xx 变非 0 退出码；|| true 是因为滚动更新期间连不上是正常的，要继续等
+            body=$(curl -fsS --max-time 5 "$URL" 2>/dev/null || true)
+            actual=$(printf '%s' "$body" | grep -o '"version":"[^"]*"' | cut -d'"' -f4 || true)
+            if [ "$actual" = "$EXPECT_TAG" ]; then
+              echo "✅ dasher-prod 已是本次构建版本：$actual"
+              exit 0
+            fi
+            echo "  等 ArgoCD 同步中… 线上=${actual:-<连不上>} 期望=$EXPECT_TAG"
+            sleep "$INTERVAL_SEC"
+          done
+          echo "❌ 超时 ${TIMEOUT_SEC}s：dasher-prod 线上版本=${actual:-<连不上>}，期望=$EXPECT_TAG"
+          echo "   排查顺序：① ArgoCD Application 是不是 Synced/Healthy"
+          echo "            ② GitOps 仓库的 overlays/prod/kustomization.yaml newTag 对不对"
+          echo "            ③ Pod 是不是 CrashLoopBackOff（多架构镜像没出 arm64？）"
+          exit 1
+          # 全程只有 curl，没有 kubectl —— 自建 runner 只做验证，不做部署。
 
   # ---------------------------------------------------------------------------
   # 7) 用可复用 workflow 报告结果，if: always() 保证不管前面成败都跑

@@ -182,15 +182,16 @@ jobs:
     name: Verify Dev (Self-Hosted Runner, 只读)
     needs: [bump-gitops-dev, build-push]
     runs-on: [self-hosted, wsl2-k3d]
-    timeout-minutes: 8            # 必须 > 下面的 TIMEOUT_SEC，否则轮询没跑完 job 先被杀
+    timeout-minutes: 12           # 必须 > 下面的 TIMEOUT_SEC，否则轮询没跑完 job 先被杀
     steps:
       - name: 轮询等 ArgoCD 把新 tag 同步进 dasher-dev，并断言线上 tag == 本次构建 tag
         env:
           EXPECT_TAG: ${{ needs.build-push.outputs.tag }}
           URL: http://localhost:30081/api/version
-          # ArgoCD 默认每 3 分钟才轮询一次 Git，所以这里的超时必须 > 180s。
-          # 死等一个固定 sleep 是错的：短了必然假失败，长了每次都白等满。
-          TIMEOUT_SEC: '300'
+          # ArgoCD 默认每 180s 才轮询一次 Git（可在 argocd-cm 的 timeout.reconciliation 调小）。
+          # 窗口 = ArgoCD 轮询周期 + 拉镜像 + 滚动更新，必须留足余量：
+          # 实测三次 3m18s / 4m28s / 5m09s —— 原来设 300s 正好卡在边界上，第三次假失败了。
+          TIMEOUT_SEC: '480'
           INTERVAL_SEC: '10'
         run: |
           set -euo pipefail

@@ -1350,7 +1350,7 @@ gh api -X PUT repos/<O>/<R>/actions/permissions/fork-pr-contributor-approval   -
 **修法**：把「死等固定时长」改成「带超时的轮询」（完整代码见 3.6）：
 
 ```bash
-deadline=$(( $(date +%s) + TIMEOUT_SEC ))     # dev 300s / prod 420s
+deadline=$(( $(date +%s) + TIMEOUT_SEC ))     # dev 480s / prod 420s
 while [ "$(date +%s)" -lt "$deadline" ]; do
   body=$(curl -fsS --max-time 5 "$URL" 2>/dev/null || true)   # 滚动更新期间连不上是正常的
   actual=$(printf '%s' "$body" | grep -o '"version":"[^"]*"' | cut -d'"' -f4 || true)
@@ -1361,6 +1361,20 @@ exit 1
 ```
 
 **同时要把 job 的 `timeout-minutes` 调到大于轮询窗口**，否则轮询还没跑完 job 先被杀。
+
+**窗口该给多大？** 别拍脑袋，量出来：窗口 = ArgoCD 轮询周期 + 拉镜像 + 滚动更新。
+我实测三次是 **3m18s / 4m28s / 5m09s**——一开始设 300s，前两次侥幸过了，
+第三次 5m09s 直接假失败。**方差比你想的大，余量要按最慢那次的 1.5 倍留**，最后定 480s。
+
+更治本的是**把 ArgoCD 的轮询周期调小**，从源头缩短这个窗口：
+
+```bash
+kubectl -n argocd patch configmap argocd-cm --type merge \
+  -p '{"data":{"timeout.reconciliation":"30s"}}'
+kubectl -n argocd rollout restart deploy/argocd-repo-server statefulset/argocd-application-controller
+```
+（生产上别无脑调小——仓库多了会给 Git 服务端压力，正解是用 **webhook** 让 Git 主动推 ArgoCD，
+把拉式轮询变成事件驱动。面试提到这一层会加分。）
 
 **学到的规律**：
 > **异步系统之间不能用 `sleep` 对齐。**

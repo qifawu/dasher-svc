@@ -43,9 +43,24 @@ labs/github-actions/
 ├── runner/wsl2-k3d/              # 自建 runner + 本地 k3d 集群 'gitops' 的搭建脚本
 │   ├── setup.sh / teardown.sh
 │   └── README.md
+├── network-policies/             # 【原 CKA 大实验并入】隔离 dasher-dev↔dasher-prod（第 13 节）
+│   ├── dasher-prod-default-deny.yaml
+│   ├── dasher-prod-allow-same-ns-and-external.yaml   # 放行同命名空间 + 外部(保住 NodePort 冒烟验证)
+│   └── dasher-prod-allow-dns-egress.yaml
+├── faults/                       # 【原 CKA 大实验并入】部署故障注入排障（第 14 节）
+│   ├── README.md / inject.sh / solutions.md
+│   └── fixtures/                 #   PVC Pending / Pod Pending / broken-kubeconfig 三个故障夹具
 ├── lab-ops.md                    # 操作合集（照课程章节顺序编号）
 └── README.md                     # 本文件
 ```
+
+## 应用隔离与部署排障（第 13–14 节，原独立 CKA 大实验并入）
+
+CI/CD 把版本推上 `dasher-dev`/`dasher-prod` 之后，"应用侧"的集群运维也贴着这条流水线走：
+**第 13 节** 用 NetworkPolicy 给两个命名空间做东西向隔离（关键约束是**不能打断第 8/9 节自建 runner
+的 NodePort 冒烟 curl**）；**第 14 节** 注入 4 类高频部署故障练排障。两节都在 `lab-ops.md` 末尾。
+注意故障 1/2 跨 lab 依赖 `labs/argocd/cluster-rbac/`（RBAC 凭证）和 `labs/cluster-ops/upgrade-drill/`
+（worker 节点），脚本里已用相对路径指过去。纯集群生命周期运维另见 `labs/cluster-ops/`。
 
 ## 跟 Jenkins 大实验的关键差异（不是偷懒，是 GitHub Actions 本身的限制）
 

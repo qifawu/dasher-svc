@@ -116,6 +116,16 @@ jobs:
           echo "tag=${{ github.run_number }}-${short_sha}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
 
+      # 多架构构建：GitHub 托管 runner 是 amd64，但自建 runner 可能在 Apple Silicon
+      # 的虚机里（arm64）。只出 amd64 的话，镜像在 arm64 集群上启动即
+      # "exec /usr/local/bin/docker-entrypoint.sh: exec format error"（实测踩过）。
+      # QEMU 提供跨架构模拟，buildx 才能一次出双架构 manifest list。
+      - name: 装 QEMU（跨架构模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 装 Buildx（多架构构建器）
+        uses: docker/setup-buildx-action@v3
+
       - name: 登录 GHCR（内置 GITHUB_TOKEN 就够，不需要额外 PAT）
         uses: docker/login-action@v3
         with:
@@ -128,6 +138,9 @@ jobs:
         with:
           context: ${{ env.APP_DIR }}
           push: true
+          # amd64 = GitHub 托管 runner / WSL2；arm64 = Apple Silicon 的 Multipass 虚机。
+          # 出成 manifest list，两种架构的节点各自拉到对的那份，集群侧零改动。
+          platforms: linux/amd64,linux/arm64
           build-args: |
             BUILD_TAG=${{ steps.meta.outputs.tag }}
             GIT_SHA=${{ steps.meta.outputs.short_sha }}

@@ -28,6 +28,10 @@ set -euo pipefail
 CLUSTER=gitops
 DEV_PORT=30081
 PROD_PORT=30082
+# dpkg 架构（amd64=WSL2/Intel，arm64=Apple Silicon 的 Multipass 虚机）——kubectl 与 runner 二进制都按它取。
+# 见 ../../mac-multipass/README.md：macOS 宿主用 Multipass 起 Ubuntu 虚机跑同一套脚本。
+ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+RUNNER_ARCH="x64"; [ "$ARCH" = "arm64" ] && RUNNER_ARCH="arm64"   # GitHub runner 包名用 x64/arm64
 RUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/actions-runner"
 RUNNER_VERSION="2.335.1"   # 需要更新版本时去 https://github.com/actions/runner/releases 查最新 tag
                             # (runner 首次连上 GitHub 后也会自动更新到最新版，这里只影响首次下载)
@@ -67,7 +71,7 @@ sudo usermod -aG docker "$USER" || true
 echo "==> [3/6] 装 kubectl（Kubernetes 官方二进制，已装过就跳过）..."
 if ! command -v kubectl >/dev/null 2>&1; then
   KUBE_VER="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
-  curl -LO "https://dl.k8s.io/release/${KUBE_VER}/bin/linux/amd64/kubectl"
+  curl -LO "https://dl.k8s.io/release/${KUBE_VER}/bin/linux/${ARCH}/kubectl"
   sudo install -m 0755 kubectl /usr/local/bin/kubectl && rm -f kubectl
 fi
 
@@ -88,6 +92,11 @@ if ! sudo k3d cluster list 2>/dev/null | grep -q "^${CLUSTER}"; then
       --wait
 else
   echo "    集群 '${CLUSTER}' 已存在，跳过创建（可能是之前跑 ArgoCD 大实验时建的，复用即可）。"
+  # k3d 端口映射只能建集群时定；旧集群若没带 30081/30082，部署后冒烟 curl localhost:3008x 会不通。
+  if ! { sg docker -c "docker port k3d-${CLUSTER}-serverlb" 2>/dev/null || docker port "k3d-${CLUSTER}-serverlb" 2>/dev/null; } | grep -qE "3008[12]"; then
+    echo "    ⚠ 现有 '${CLUSTER}' 集群没映射 NodePort ${DEV_PORT}/${PROD_PORT}，冒烟 curl 会不通。"
+    echo "      修复（确认没有别的大实验在用后）： k3d cluster delete ${CLUSTER} && bash \"\$0\""
+  fi
 fi
 
 echo "    预建 dasher-dev / dasher-prod 两个 namespace（ArgoCD 同步时也会用到，提前建不冲突）..."
@@ -99,10 +108,10 @@ if [ ! -d "${RUNNER_DIR}" ]; then
   mkdir -p "${RUNNER_DIR}"
   (
     cd "${RUNNER_DIR}"
-    curl -L -o actions-runner-linux-x64.tar.gz \
-      "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
-    tar xzf actions-runner-linux-x64.tar.gz
-    rm -f actions-runner-linux-x64.tar.gz
+    curl -L -o actions-runner.tar.gz \
+      "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
+    tar xzf actions-runner.tar.gz
+    rm -f actions-runner.tar.gz
   )
 else
   echo "    ${RUNNER_DIR} 已存在，跳过下载。"
@@ -114,16 +123,30 @@ echo " 集群 + runner 二进制就绪！"
 echo "------------------------------------------------------------"
 echo " 自检：kubectl get nodes ; k3d cluster list ; kubectl get ns"
 echo ""
-echo " ⚠️ 剩下这步没法脚本化，需要你手动做一次（GitHub 不允许脚本拿到注册 token）："
+echo " 最后一步：注册 runner。两条路，任选其一。"
+echo ""
+echo " 【A】命令行全自动（推荐，注册 token 可以用 REST API 取，不用开浏览器）："
+echo "      REST 端点 POST /repos/{owner}/{repo}/actions/runners/registration-token"
+echo "      需要对该仓库有 admin 权限的凭证；gh CLI 登录过就直接能用："
+echo ""
+echo "        RT=\$(gh api -X POST repos/<OWNER>/<REPO>/actions/runners/registration-token --jq .token)"
+echo "        cd ${RUNNER_DIR}"
+echo "        ./config.sh --url https://github.com/<OWNER>/<REPO> --token \"\$RT\" \\"
+echo "                    --labels wsl2-k3d --name ${ARCH}-runner --unattended --replace"
+echo ""
+echo "      （token 一小时过期，现取现用。旧版 lab 文档说\"GitHub 不允许脚本拿注册 token\"是错的。）"
+echo ""
+echo " 【B】网页手动（课程视频里演示的路子）："
 echo "   1. 打开你的 dasher-svc 仓库 → Settings → Actions → Runners → New self-hosted runner"
-echo "   2. 选 Linux / x64，复制页面上的 token"
+echo "   2. 选 Linux / ${RUNNER_ARCH}（本机架构=${ARCH}），复制页面上的 token"
 echo "   3. 回到这台机器： cd ${RUNNER_DIR}"
 echo "      ./config.sh --url https://github.com/<OWNER>/<REPO> \\"
 echo "                  --token <粘贴刚才复制的 token> \\"
 echo "                  --labels wsl2-k3d --name wsl2-k3d-runner --unattended"
 echo "      （--labels wsl2-k3d 是关键：workflow 里 runs-on: [self-hosted, wsl2-k3d] 要靠它匹配到这台 runner）"
-echo "   4. 装成系统服务，这样关终端/重启 WSL 也不用手动重启 runner："
-echo "      sudo ./svc.sh install && sudo ./svc.sh start"
+echo ""
+echo " 装成系统服务（两条路都要做，这样关终端/重启也不用手动拉起 runner）："
+echo "      sudo ./svc.sh install \$(whoami) && sudo ./svc.sh start"
 echo "      （不想装服务、只想临时跑一次也可以直接 ./run.sh 前台跑）"
 echo "------------------------------------------------------------"
 echo " 完成后去仓库 Settings → Actions → Runners 确认状态是 Online。"

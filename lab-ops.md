@@ -189,6 +189,240 @@
 
 ---
 
+# 🛡️ 应用隔离与部署排障（原独立 CKA 大实验的 NetworkPolicy/Troubleshooting 部分并入本实验）
+
+> **为什么并到 GitHub Actions 大实验里**：这两块是**"应用侧"**的集群运维——给这条流水线部署的
+> `dasher-dev`/`dasher-prod` 做网络隔离、以及排查部署常见故障，天然贴着 CI/CD 走。尤其 NetworkPolicy
+> 这节的第一约束就是**不能打断本实验第 8/9 节自建 runner 对 `:30081`/`:30082` 的 NodePort 冒烟 curl**——
+> 这正是"运维加固不能打断正在跑的 CI/CD 验证"这个真实约束的落地。（纯集群生命周期运维——etcd 备份、
+> 节点升级——不贴 CI/CD，另立 `labs/cluster-ops/`。）
+>
+> ⚠️ 这两节直接跑在活的 `gitops` 集群上，可逆性是纪律：第 13 节结尾把新增策略删干净；第 14 节的故障
+> 对象都是一次性的、各自 `undo`。对应 CKA **Services & Networking** 和 **Troubleshooting** 域。
+
+## 13 · NetworkPolicy 隔离 dasher-dev↔dasher-prod (CKA Services & Networking)
+
+**目标**：给 `dasher-prod` 做东西向隔离——**同命名空间能通、外部 NodePort 能进（不打断本实验的冒烟验证）、
+但 dasher-dev 的 Pod 不能横向摸到 dasher-prod**，并讲清"忘开 DNS egress"这个经典大坑。清单在
+`network-policies/`，**必须按顺序 apply**（先默认拒绝，再逐条放行）。
+
+```bash
+cd network-policies
+
+# 先量一次基线：从 dasher-dev 起一个探针 Pod 打 dasher-prod，此刻应该是通的（还没加策略）
+kubectl run probe -n dasher-dev --rm -it --image=busybox --restart=Never -- \
+  wget -qO- --timeout=3 http://dasher-svc.dasher-prod:8000/healthz     # 现在应回 ok
+
+# 1) 默认拒绝 dasher-prod 的所有入向流量（白名单模式起点）
+kubectl apply -f dasher-prod-default-deny.yaml
+# 2) 放行两个口子：同命名空间 Pod 互访 + 外部(NodePort 冒烟验证/人肉 curl)
+kubectl apply -f dasher-prod-allow-same-ns-and-external.yaml
+# 3) 放行 DNS egress（本实验只对 dasher-prod 做了 Ingress 限制，这条是"预置+讲原理"，见下面大坑）
+kubectl apply -f dasher-prod-allow-dns-egress.yaml
+
+kubectl get networkpolicy -n dasher-prod   # 应看到 default-deny-ingress / allow-same-namespace /
+                                           #        allow-external-nodeport-healthchecks / allow-dns-egress
+```
+
+**验证三条边界**（这一节的产出）：
+
+```bash
+# ① 外部 NodePort 依旧能进（保住本实验第 8/9 节自建 runner 对 :30082 的冒烟 curl）
+curl -s http://localhost:30082/healthz     # ✅ 应回 ok —— 证明"运维加固没打断已有 CI/CD 冒烟验证"
+
+# ② dasher-prod 命名空间内部互访不受影响（同命名空间放行）
+kubectl exec -n dasher-prod deploy/dasher-svc -- wget -qO- --timeout=3 http://dasher-svc.dasher-prod:8000/healthz  # ✅ ok
+
+# ③ 跨命名空间横向移动被挡（真正的隔离目标）：dasher-dev 的 Pod 打 dasher-prod 应超时
+kubectl run probe -n dasher-dev --rm -it --image=busybox --restart=Never -- \
+  wget -qO- --timeout=3 http://dasher-svc.dasher-prod:8000/healthz     # 🚫 预期超时/拒绝
+
+# ④ DNS 仍能解析（Ingress 策略不拦 DNS，此刻正常）
+kubectl exec -n dasher-prod deploy/dasher-svc -- nslookup kubernetes.default   # ✅ 正常解析
+```
+
+**该看到什么（本实验 k3d 默认 CNI = flannel + kube-router 下的实测现象，务必以你自己实测为准）**：
+`:30082` 外部 curl 和同命名空间访问都正常，**dasher-dev→dasher-prod 在本环境会超时**——达到"只挡集群内
+跨命名空间横向移动、不锁死对外暴露"的效果。为什么 NodePort 能进？NodePort 流量在 k3d 的 flannel+kube-router
+实现里源地址被识别为"外部"、命中 `ipBlock: 0.0.0.0/0` 放行规则；dasher-dev 的 Pod 走 ClusterIP/Pod IP
+打过来，在本实现里源是集群内 Pod IP、不命中这条"外部"放行、被 default-deny 挡住。
+
+> ⚠️ **别把 dev→prod 超时当定论——`0.0.0.0/0` 是否也放行 Pod→Pod 取决于 CNI**：`0.0.0.0/0` 字面上把
+> **整个 IPv4** 都放行，本就**包含集群 Pod CIDR**。本实验能挡住 dasher-dev 的 Pod，靠的是 kube-router 把
+> `ipBlock` 里这条只当"外部识别"的源来匹配、而 dev Pod 的源是集群内 Pod IP；**换 Calico / Cilium / 云厂商
+> CNI，`0.0.0.0/0` 完全可能连 Pod CIDR 一起放行 → dev→prod 变成放行、不再超时**。要稳妥地"放外部、但排除
+> 集群内 Pod"，规范做法是给 `ipBlock` 加 `except:` 把 Pod CIDR 显式挖掉：
+> ```yaml
+> - ipBlock:
+>     cidr: 0.0.0.0/0
+>     except: ["10.42.0.0/16"]   # k3d/k3s 默认 Pod CIDR，按你集群实际改
+> ```
+
+> ⚠️ **CNI 到底 enforce 不 enforce（比 DNS 更值得你深挖的一层）**：NetworkPolicy 只是一份"期望"，
+> 真正拦不拦流量取决于 CNI 的 dataplane——
+> - **纯 flannel 根本不实现 NetworkPolicy**，策略写了也是摆设；k3s（k3d 底层）默认额外跑了 kube-router 的
+>   Network Policy Controller，用 **iptables/ipset** 把策略翻译成规则，所以这里能直接生效。
+> - **iptables vs eBPF 两种 dataplane**：Calico、Cilium 可选 eBPF 直接在内核 hook 上匹配，相比 iptables
+>   线性 match，规则规模大时延迟更稳、可观测性更强（如 Cilium Hubble）；纯 iptables 实现则规则一多链就变长。
+>   面试被问"我的 NetworkPolicy 为什么不生效"，第一反应就是**查 CNI 支不支持、用的哪种 dataplane**。
+> - **NodePort 源地址（你的强项交叉区）**：本实验放行外部靠的是"NodePort 流量源被识别为集群外"。但这强依赖
+>   `Service.spec.externalTrafficPolicy`——默认 `Cluster` 会 **SNAT/masquerade**，客户端真实源 IP 被节点 IP 顶替
+>   （想按真实 client IP 写 `ipBlock` 就会失配）；`Local` 保留源 IP 但只把流量投给本节点上有 Pod 的情况。
+>   源地址是保留还是伪装，直接决定 `ipBlock`/`namespaceSelector` 规则命不命中。
+
+> 📌 **适用边界（生产判断，别照搬）**：上面这套现象**只在本实验的 k3d/k3s 默认网络（flannel + kube-router）
+> 下验证过**。换 **Calico / Cilium / 云厂商 CNI**（AWS VPC CNI、Azure CNI、GKE Dataplane V2 等）时，NodePort 的
+> source-IP 保留/伪装、以及策略对"外部流量"的判定都可能不一样，**必须在目标环境重新验证**，不能拿本实验结论当定论。
+
+> 🔥 **经典大坑：忘开 DNS egress**。只加 Ingress 不拦 DNS；但一旦顺手把 **Egress default-deny** 也开上
+> （防 Pod 被攻破后外联下载恶意载荷），CoreDNS（在 kube-system，UDP/TCP 53）首当其冲——症状是应用报
+> `DNS resolution failed` 而不是"network policy"，排查方向极易被带偏。所以做 Egress 收紧时**必须同时放行 53**。
+> 想亲手体验一次（`dasher-prod-allow-dns-egress.yaml` 文件尾部有完整步骤）：
+> ```bash
+> # 临时加一条 Egress 全拒绝，触发大坑
+> kubectl apply -n dasher-prod -f - <<'EOF'
+> apiVersion: networking.k8s.io/v1
+> kind: NetworkPolicy
+> metadata: { name: temp-default-deny-egress }
+> spec: { podSelector: {}, policyTypes: ["Egress"] }
+> EOF
+> kubectl exec -n dasher-prod deploy/dasher-svc -- nslookup kubernetes.default   # 🚫 解析超时——大坑现形
+> kubectl apply -f dasher-prod-allow-dns-egress.yaml                             # 放行 DNS(UDP/TCP 53)
+> kubectl exec -n dasher-prod deploy/dasher-svc -- nslookup kubernetes.default   # ✅ 恢复
+> kubectl delete networkpolicy temp-default-deny-egress -n dasher-prod           # 收尾撤掉临时策略
+> ```
+
+> 🎯 **面试话术**：我给一个 prod 命名空间做过东西向隔离，思路是白名单——先 default-deny 入向，再精确放行两类：
+> 同命名空间互访、和外部 NodePort 健康检查。**关键是没放行别的命名空间**，这样 dev 命名空间的 Pod 就没法
+> 横向摸到 prod 的 Pod，但对外暴露的口子和正在跑的 CI 冒烟验证一个都没打断——安全不是把所有东西都堵上。
+> 我还特意留了一条 DNS egress 策略讲原理：很多人加 Egress default-deny 时忘了放行 53 端口，结果整个命名空间
+> 域名解析全挂，报错还是"DNS failed"不是"network policy"，排查方向都被带偏——这个坑我踩过、也知道怎么一眼看穿。
+> 至于 dev→prod 到底挡不挡，还取决于 CNI 的 dataplane——我在 k3d 默认 CNI 下实测是挡住的，但 `0.0.0.0/0` 本就
+> 含 Pod CIDR，换 Calico/Cilium/云厂商 CNI 可能连 Pod 一起放行，我不会拿一个环境的结论当定论，换环境一定重测。
+>
+> 🎯 **English (interview)**: I did east-west isolation on a prod namespace with a whitelist model —
+> default-deny ingress, then allow exactly two paths: same-namespace traffic and external NodePort health
+> checks. The key is *not* allowing other namespaces, so a dev-namespace pod can't move laterally into prod,
+> while the external port and the running CI smoke checks stay up — security isn't blocking everything.
+> I also keep a DNS-egress rule around to teach the classic trap: the moment you add an Egress default-deny
+> and forget to allow port 53, the whole namespace's name resolution dies — and the error reads "DNS
+> resolution failed", not "network policy", which sends triage the wrong way. I've hit it and know how to
+> spot it instantly. Whether a NetworkPolicy is actually enforced depends on the CNI dataplane — plain
+> flannel doesn't enforce it at all — so "my policy isn't working" starts with checking the CNI, not
+> re-reading the YAML.
+
+**收尾（把这一节加的四条策略删掉，`dasher-prod` 恢复"默认全通"）**：
+
+```bash
+kubectl delete -f dasher-prod-allow-dns-egress.yaml
+kubectl delete -f dasher-prod-allow-same-ns-and-external.yaml
+kubectl delete -f dasher-prod-default-deny.yaml
+kubectl delete networkpolicy temp-default-deny-egress -n dasher-prod --ignore-not-found  # 若体验过 DNS 大坑
+kubectl get networkpolicy -n dasher-prod   # 应为空
+cd ..
+```
+
+## 14 · 部署故障注入排障 (CKA Troubleshooting)
+
+**目标**：用 `faults/inject.sh` 往集群里注入 4 类 CKA 高频故障，**先自己用 `describe`/`events`/`logs` 诊断，
+卡住再对答案**（`faults/solutions.md`）。四个故障都是独立一次性对象，不碰 `dasher-svc` 本身。玩法见
+`faults/README.md`。
+
+> ⚠️ **跨 lab 前提**：这套故障原属独立 CKA 大实验，拆分后 RBAC 和节点运维分别去了 argocd / cluster-ops
+> 两个 lab，所以**故障 1 依赖 `labs/argocd/cluster-rbac/gen-kubeconfig.sh` 先签发过 `new-hire.kubeconfig`；
+> 故障 2 依赖 `labs/cluster-ops/upgrade-drill/node-upgrade-drill.sh add` 先加过 `cka-worker` 节点**。
+> `inject.sh`/`solutions.md` 里已用跨 lab 相对路径指过去；故障 3/4 自包含、无跨 lab 依赖，随时能跑。
+
+### 14a · 可立即跑（故障 3 / 4，本 lab 自足，无跨 lab 依赖）
+
+```bash
+cd faults
+
+# 故障 3：PVC 一直 Pending（Storage 域）
+bash inject.sh 3
+kubectl describe pvc scratch-data -n dasher-dev     # Events 找 ProvisioningFailed / 找不到 StorageClass
+kubectl get storageclass                            # 集群真实只有 local-path；PVC 却写了 fast-nvme(打错字)
+# 修：storageClassName 是 immutable 字段，改不了、只能删了重建（这本身就是 CKA 常考细节）
+bash inject.sh undo 3
+
+# 故障 4：Pod 一直 Pending（Workloads & Scheduling 域）
+bash inject.sh 4
+kubectl describe pod -l app=scratch-workload -n dasher-dev
+#   Events: FailedScheduling ... 0/N nodes are available: didn't match Pod's node affinity/selector
+kubectl get nodes --show-labels                     # 没有节点带 disktype=ssd → nodeSelector 匹配不上
+# 修二选一：
+#  (a) 给节点补上 nodeSelector 要的 label —— 先导出节点名再 label，别手填占位符：
+NODE=$(kubectl get nodes -o name | head -n1 | sed 's#node/##')   # 取第一个节点名（单节点集群就是它）
+kubectl label node "$NODE" disktype=ssd                          # Pod 随即被调度上去
+#  (b) 或者删掉 Pod 清单里那条匹配不到的 nodeSelector（改回本无该约束的版本）
+bash inject.sh undo 4
+cd ..
+```
+
+### 14b · 跨 lab 加餐（故障 1 / 2，需先做前置：argocd §11 的 RBAC / cluster-ops 的加节点）
+
+这两个故障依赖别的 lab 建好的对象，先把**前置**跑一遍再注入（对应 lab 已做过就跳过对应那行）：
+
+```bash
+cd faults   # 从 labs/github-actions/ 起；下面相对路径都以 faults 为基准
+
+# —— 前置（一次性）——
+# 故障 1 需要 new-hire.kubeconfig：到 argocd cluster-rbac 建身份并签一份（子 shell 内 cd，跑完自动回 faults）
+( cd ../../argocd/cluster-rbac && kubectl apply -f 00-namespace-and-serviceaccounts.yaml && bash gen-kubeconfig.sh new-hire )
+# 故障 2 需要 cka-worker 节点：到 cluster-ops upgrade-drill 加一个（子 shell 内 cd 跑，跑完自动回 faults）
+( cd ../../cluster-ops/upgrade-drill && bash node-upgrade-drill.sh add )
+
+# 故障 1：kubeconfig 凭证损坏（Cluster Architecture / 认证）
+#   前提：上面“前置”已在 labs/argocd/cluster-rbac/ 签发过 new-hire.kubeconfig
+bash inject.sh 1
+#   注入脚本把坏掉的 kubeconfig 写在 faults/ 目录下(不是 fixtures/)，名为 new-hire-broken.kubeconfig
+kubectl --kubeconfig=new-hire-broken.kubeconfig get pods -n dasher-dev
+#   报 "You must be logged in to the server (Unauthorized)" —— 注意 Unauthorized(认证没过)
+#   跟 Forbidden(认证过了但 RBAC 不让) 是两个方向！token 被截断了一半
+# 修：TokenRequest 是无状态的，直接重签：cd ../../argocd/cluster-rbac && bash gen-kubeconfig.sh new-hire
+rm -f new-hire-broken.kubeconfig                    # 故障1是文件，直接删掉即清理
+
+# 故障 2：节点 NotReady（Cluster Maintenance / Troubleshooting）
+#   前提：先跑过 cluster-ops 的 upgrade-drill add（labs/cluster-ops/upgrade-drill/），集群里存在 cka-worker 节点
+bash inject.sh 2
+sleep 45                                            # 等过 node-monitor-grace-period(默认 40s)
+kubectl get nodes                                   # cka-worker 变 NotReady
+kubectl describe node $(kubectl get nodes -o name | grep cka-worker | sed 's#node/##')
+#   Conditions 里 Ready 的 Reason 类似 "Kubelet stopped posting node status"
+bash inject.sh undo 2                               # docker unpause，几十秒后自动回 Ready
+cd ..
+```
+
+**该看到什么/学到什么**：
+- 故障 1：分清 **Unauthorized(认证)** vs **Forbidden(授权)**，排查方向完全不同。
+- 故障 2：**NotReady 是"节点没按时打卡"不是"被判死刑"**——kubelet 心跳恢复后 controller-manager 自动改回 Ready，
+  不用手动 kubectl。顺带体会为什么生产要"节点≥2 + 副本≥2"（单节点故障就是全灭）。
+- 故障 3：**immutable 字段（PVC 的 storageClassName）改不了，只能删了重建**——不是所有字段都能 edit/patch。
+- 故障 4：**`get pods` 只显示 Pending 什么都看不出，必须 `describe` 看 Events**——养成先看 Events 的习惯。
+- 通用套路：`kubectl describe` → 看 **Events** → `kubectl get events --sort-by=.lastTimestamp` 拉时间线 →
+  `kubectl logs`。这就是 Troubleshooting 域的实战版。
+
+> 设计取舍（见 `faults/README.md`）：没做"改坏 kube-apiserver 静态 Pod manifest"这类故障——k3s/k3d 里
+> apiserver 不是静态 Pod（跑在 k3s 单二进制进程里），硬模拟出来的现象跟真实 kubeadm 集群对不上，容易学出
+> 错误直觉，这类留给笔记用文字讲原理即可。
+
+> 🎯 **面试话术**：排障我有套固定套路——先 `kubectl describe` 看 Events，再 `get events` 按时间排拉时间线，
+> 最后才 `logs`。举几个我练过的典型：PVC 一直 Pending，八成是 storageClassName 打错字或没有对应 provisioner，
+> 而且这字段 immutable、只能删了重建；Pod 一直 Pending 光看 `get pods` 什么都看不出，一定要 describe 看
+> FailedScheduling，通常是 nodeSelector/affinity 匹配不到节点或资源不够；节点 NotReady 我会先分清是不是
+> kubelet 心跳超了 grace period，很多时候节点自己会恢复，不用瞎动。还有个爱考的点是分清 Unauthorized 是
+> 认证没过、Forbidden 是 RBAC 不让，报错长得像但排查方向反着来。
+>
+> 🎯 **English (interview)**: I have a fixed troubleshooting loop — `kubectl describe` for Events first,
+> then `get events` sorted by time for a timeline, and only then logs. A few patterns I've drilled: a PVC
+> stuck Pending is usually a typo'd storageClassName or a missing provisioner, and that field is immutable
+> so you delete and recreate; a Pod stuck Pending shows nothing under `get pods`, you must describe for
+> FailedScheduling; a NotReady node is often just a kubelet heartbeat past its grace period and self-heals.
+> And I always separate Unauthorized (authn failed) from Forbidden (authn passed, RBAC denied) — they look
+> alike but the fix is the opposite direction.
+
+---
+
 ## 🚀 进阶（面试加分，做完基础版再挑着来）
 
 - **Action Pinning 到 commit SHA**：把 `actions/checkout@v4` 这类换成 `actions/checkout@<40位sha>`，

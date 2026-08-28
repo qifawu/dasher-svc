@@ -48,7 +48,7 @@ runs:
   using: 'composite'
   steps:
     - name: checkout GitOps 配置仓库
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         repository: ${{ inputs.gitops-repo }}
         token: ${{ inputs.gitops-pat }}

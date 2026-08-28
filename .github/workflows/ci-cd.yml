@@ -64,10 +64,10 @@ jobs:
         node: [18, 20]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node ${{ matrix.node }}（带 npm 缓存，Cache-Node-Dependencies 一课）
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -81,12 +81,12 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         run: npm test | tee test-output.log
 
-      # 只在 node20 这条腿上传，避免同名 artifact 在 actions/upload-artifact@v4 下
+      # 只在 node20 这条腿上传，避免同名 artifact 在 actions/upload-artifact@v7 下
       # 多个矩阵腿并发上传冲突（v4 起同名 artifact 不再像 v3 那样自动合并）——
       # 这个坑本身就是面试可以聊的点。对应 Storing-workflow-data-as-artifacts 一课。
       - name: 上传测试日志 artifact
         if: matrix.node == 20
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dasher-svc-test-log
           path: ${{ env.APP_DIR }}/test-output.log
@@ -107,7 +107,7 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 算本次制品 tag（对应 Jenkins 大实验同款套路：run_number + git 短7位sha，可追溯）
         id: meta
@@ -121,20 +121,20 @@ jobs:
       # "exec /usr/local/bin/docker-entrypoint.sh: exec format error"（实测踩过）。
       # QEMU 提供跨架构模拟，buildx 才能一次出双架构 manifest list。
       - name: 装 QEMU（跨架构模拟）
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: 装 Buildx（多架构构建器）
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: 登录 GHCR（内置 GITHUB_TOKEN 就够，不需要额外 PAT）
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: docker build + push（tag = <run_number>-<git短sha>）
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ env.APP_DIR }}
           push: true
@@ -160,7 +160,7 @@ jobs:
     environment: dev
     steps:
       - name: Checkout（拿到本仓库里的 composite action 定义）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 调用自定义 composite action，只改 GitOps 仓库不碰集群
         uses: ./.github/actions/bump-gitops-tag
@@ -219,7 +219,7 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 调用同一个 composite action，这次改 prod overlay
         uses: ./.github/actions/bump-gitops-tag

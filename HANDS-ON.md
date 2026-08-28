@@ -730,7 +730,8 @@ gh api repos/<OWNER>/<REPO>/actions/runs/<RUN_ID>/approvals
 
 > ⚠️ **重大坑，详见 Part 6 坑 4**：GitHub Free 账号下，**private 仓库不支持 Environments 保护规则**。
 > 把仓库转成 private 会**静默清空**已配好的 required reviewers，`protection_rules` 变成 `[]`，
-> 审批门直接失效且**不给任何提示**。
+> 审批门直接失效且不给任何提示；**转回 public 也不会自动恢复，得手动重建**。
+> 同一个可见性开关还会连带干掉 code scanning、把 Actions 额度从无限变成 2000 分钟/月。
 
 **`if:` 表达式要点：**
 
@@ -1243,10 +1244,10 @@ mediaType: application/vnd.oci.image.index.v1+json
 > 而只要开发机和运行环境架构不同（Apple Silicon 现在极其普遍），
 > **多架构构建就不是可选项**。
 
-## 坑 4 · ⚠️ 仓库转 private，Environments 保护规则被静默清空
+## 坑 4 · ⚠️ 仓库转 private，一次损失三样东西
 
-**现象**：`prod` 环境明明配过 required reviewers，但流水线跑到 `promote-prod` **8 秒直接放行**，
-完全没有等待审批。
+**现象**：`prod` 环境明明配过 required reviewers，流水线跑到 `promote-prod` **8 秒直接放行**，
+完全没等审批。另外每次 push 都收到一封 CodeQL 失败邮件。
 
 **证据**：
 
@@ -1256,31 +1257,86 @@ $ gh api repos/<O>/<R>/environments --jq '.environments[]|{name,protection_rules
 {"name":"prod","protection_rules":[{"type":"required_reviewers","reviewers":["qifawu"]}]}
 
 # 转 private 之后
-{"name":"prod","protection_rules":[]}          # ← 被清空了
-
+{"name":"prod","protection_rules":[]}          # ← 被清空了，UI 上看不出来
 $ gh api repos/<O>/<R>/actions/runs/<RUN_ID>/approvals
 []                                              # ← 根本没有审批记录
+
+# CodeQL：扫描跑完了，是上传被拒
+##[error]Code scanning is not enabled for this repository.
+$ gh api -X PATCH repos/<O>/<R> -f 'security_and_analysis[advanced_security][status]=enabled'
+=> 422 "Advanced security has not been purchased."
 ```
 
-**根因**：**GitHub Free 账号下，Environments 的保护规则（required reviewers / wait timer /
-deployment branches）只在 public 仓库可用**。仓库转成 private 后规则被移除，
-**且没有任何提示**——UI 上看不出来，workflow 照跑不误。
+**根因**：**GitHub Free 账号下，一批功能是跟「仓库是 public」绑定的**，转 private 就没了，
+而且**不给任何提示**：
 
-**这个坑的来龙去脉本身就是好素材**：我是为了消除「自建 runner 挂 public 仓库会被 fork PR
-执行任意代码」的风险才转的 private，结果换来了审批门失效。这是一个**真实的安全 vs 功能权衡**。
-
-**三条路：**
-
-| 选择 | 得到 | 失去 |
+| 功能 | public (Free) | private (Free) |
 |---|---|---|
-| 转回 public | 审批门；靠关闭 fork + 外部贡献者首次 PR 需审批压风险 | fork-PR 攻击面没彻底消除 |
-| 保持 private | 彻底消除 fork-PR 风险 | 审批门，只能用 `workflow_dispatch` 输入或人工分段 rerun 模拟 |
-| 升 GitHub Pro | 两者都要 | 每月 $4 |
+| Environments 保护规则（审批门 / wait timer / 分支策略） | ✅ | ❌ 静默清空 |
+| Code scanning（CodeQL 上传结果） | ✅ | ❌ 要买 Advanced Security |
+| Actions 额度 | 无限 | 2000 分钟 / 月 |
 
-**学到的规律**：
-> **仓库可见性不只是「谁能看见」，它会连带改变一整批功能的可用性**
-> （Environments 保护规则、Actions 免费额度、Pages、部分安全功能）。
-> 改可见性之前先问一句「我现在依赖的哪些功能是跟可见性绑定的」。
+**处理办法（两步）：**
+
+```bash
+# 1) 转回 public —— 审批门和 CodeQL 都回来
+gh repo edit <O>/<R> --visibility public --accept-visibility-change-consequences
+
+# 2) 重建被清空的审批门（转私有时丢了，转回来不会自动恢复）
+GHID=$(gh api user --jq .id)          # ⚠️ 别用 UID，那是 bash 只读变量，会拿到系统 uid
+gh api -X PUT repos/<O>/<R>/environments/prod --input - <<JSON
+{"reviewers":[{"type":"User","id":$GHID}],"deployment_branch_policy":null}
+JSON
+gh api repos/<O>/<R>/environments --jq '.environments[]|{name,protection_rules}'
+```
+
+**让 CodeQL 在 private 下不再刷失败邮件**（这样两种可见性都能跑）：
+
+```yaml
+jobs:
+  analyze:
+    # private 仓库上 code scanning 不可用，跑到 upload-sarif 必失败。
+    # 按可见性自动跳过，转回 public 自动恢复，不用改文件。
+    if: github.event.repository.visibility == 'public'
+```
+
+### 那 public + 自建 runner 的安全问题呢？
+
+这是当初转 private 的动机。**先说一个我一开始搞错的事实**：
+`allow_forking: false` **在个人仓库上设不了**，API 直接拒绝：
+
+```
+422 "Allow forks setting can only be changed on org-owned private repositories"
+```
+
+所以「关掉 fork」这条路对个人 public 仓库不存在。**真正决定风险的是你的 `on:` 触发器**：
+
+```bash
+# 逐个 workflow 查：哪些触发器 + 哪些 job 跑在自建 runner 上
+# ci-cd.yml      触发=[push, workflow_dispatch]              自建runner=[verify-dev, verify-prod]
+# security.yml   触发=[push, pull_request, schedule, ...]    自建runner=无
+```
+
+**`ci-cd.yml` 没有 `pull_request` 触发器**，而 fork PR 只能产生 `pull_request` 事件
+（fork 里的 `push` 事件跑在 fork 自己的仓库上，用不了你的 runner）。
+所以**外人根本触发不了那两个自建 runner 的 job**——要触发 `push` 到 main 得先有写权限。
+唯一带 `pull_request` 的 `security.yml` 全跑在 `ubuntu-latest` 上，碰不到你的机器。
+
+再加一道兜底，把 fork PR 的 workflow 审批策略收到最严：
+
+```bash
+gh api -X PUT repos/<O>/<R>/actions/permissions/fork-pr-contributor-approval   -f approval_policy='all_external_contributors'
+# 可选值：first_time_contributors_new_to_github | first_time_contributors | all_external_contributors
+```
+
+**学到的规律（两条）：**
+> ① **仓库可见性不只是「谁能看见」**，它连带决定一整批功能可不可用
+> （Environments 保护规则、code scanning、Actions 额度）。改之前先问
+> 「我现在依赖的哪些功能是跟可见性绑定的」。
+> ② **评估自建 runner 的暴露面，要看的是 `on:` 触发器和 `runs-on` 的组合，
+> 而不是仓库是不是 public。** 「public 仓库 + 自建 runner = 危险」是个正确但粗糙的直觉；
+> 精确的问法是「有没有**外部可触发的事件**能派发到自建 runner 上」。
+> 面试时能把这个区分讲出来，比背安全条款有说服力得多。
 
 ## 坑 5 · `sleep 15` 遇上 ArgoCD 的 3 分钟轮询 —— 必然的假失败
 
@@ -1402,12 +1458,19 @@ done
 > 这个区分是我这套设计里最核心的安全边界。
 
 **Q5. 自建 runner 有什么风险？你怎么处理的？**
-> 最大的风险是**挂在 public 仓库上**：任何人 fork + 改一行 workflow + 提 PR，
-> 就能在我的机器上执行任意代码。我做了三层：仓库转 private 消灭 fork-PR 攻击面；
-> runner 跑在 Multipass 虚机里而不是宿主机上，多一层隔离；runner 上的 job 只有只读操作。
-> 转 private 是有代价的——**GitHub Free 下 private 仓库不支持 Environments 保护规则，
-> 我的 prod 审批门被静默清空了**。这是个真实的安全 vs 功能权衡，我把三个选项都评估过。
-> 生产环境更规范的做法是 ephemeral runner + Actions Runner Controller，每个 job 一个干净 Pod。
+> 常见说法是「public 仓库挂自建 runner 很危险」——任何人 fork、改一行 workflow、提 PR，
+> 就能在你机器上跑任意代码。这个直觉对，但**太粗糙**。精确的问法是：
+> **有没有外部可触发的事件能派发到自建 runner 上？**
+> 我逐个 workflow 查过触发器和 `runs-on` 的组合：用自建 runner 的两个 job 都在 `ci-cd.yml` 里，
+> 而它只监听 `push` 和 `workflow_dispatch`，**没有 `pull_request`**——fork PR 只能产生
+> `pull_request` 事件，所以外人根本触发不到；唯一带 `pull_request` 的是 CodeQL 那个 workflow，
+> 它全跑在托管 runner 上。
+> 在这个基础上我还做了三层兜底：runner 跑在 Multipass 虚机里而不是 macOS 宿主上；
+> runner 上的 job 只有 curl，没有 kubectl、连 checkout 都不做；
+> fork PR 的 workflow 审批策略设成 `all_external_contributors`。
+> 我中间还试过直接转 private，结果**连带丢了 prod 审批门和 CodeQL**（GitHub Free 下这两个绑定 public），
+> 所以又转了回来——这是个真实的安全 vs 功能权衡。
+> 生产上更规范的做法是 ephemeral runner + Actions Runner Controller，每个 job 一个干净 Pod。
 
 **Q6. matrix 是什么？`include` 和 `exclude` 呢？**
 > `strategy.matrix` 把一个 job 按变量组合展开成多个并行 job，多维就是笛卡尔积。
